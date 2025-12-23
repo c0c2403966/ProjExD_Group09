@@ -19,6 +19,17 @@ STAGE2_TMR = 1500  # 60FPS想定
 # グローバル（現在ステージの接地Y）
 GROUND_Y = HEIGHT - 60
 
+# ===== HP/ダメージ（追加）=====
+HP_MAX = 100
+DMG = 20
+POPUP_FRAMES = 120   # 約2秒（60FPS想定）
+INV_FRAMES = 30      # 無敵0.5秒（接触中に毎フレーム減るのを防ぐための実装上の仮定）
+
+# ===== 右下UI（Attack/Status）（追加）=====
+BOX_W, BOX_H = 220, 110
+BOX_GAP = 14
+BOX_MARGIN = 20
+
 PERSIST_ITEM_LEVEL = False
 
 # =========================
@@ -112,19 +123,13 @@ def detect_ground_y(bg_scaled: pg.Surface) -> int:
     """
     リサイズ済み背景から「暗くて横方向に均一な水平ライン」を推定し、
     その“1px下”を地面Yとして返す。
-
-    根拠：
-    - 横方向に広がる地面境界の線（黒系）を想定
-    - mean(明るさ)が低く、std(ばらつき)が小さい行を優先
     """
     w, h = bg_scaled.get_size()
 
-    # 検出範囲（下半分中心に探す）
-    # 背景によってはここを広げると安定する
     y_start = int(h * 0.40)
     y_end = int(h * 0.90)
 
-    x_step = 4  # 横は間引き（速度優先）
+    x_step = 4
     best_y = int(h * 0.75)
     best_score = 10**18
 
@@ -134,7 +139,6 @@ def detect_ground_y(bg_scaled: pg.Surface) -> int:
         n = 0
         for x in range(0, w, x_step):
             r, g, b, a = bg_scaled.get_at((x, y))
-            # 近似輝度（一般的な重み）
             lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
             s += lum
             s2 += lum * lum
@@ -144,19 +148,16 @@ def detect_ground_y(bg_scaled: pg.Surface) -> int:
         var = (s2 / n) - mean * mean
         std = (var ** 0.5) if var > 0 else 0.0
 
-        # “暗い”＋“横一線で均一”を狙う
         score = mean + 0.3 * std
-
         if score < best_score:
             best_score = score
             best_y = y
 
-    # 線の上に乗るとめり込むことがあるので1px下を床にする
     return min(h - 1, best_y + 1)
 
 
 # =========================
-# クラス（必要に応じて get_～ を用意）
+# クラス
 # =========================
 class Background:
     """
@@ -168,8 +169,6 @@ class Background:
         self._speed = speed
         self._x1 = 0
         self._x2 = WIDTH
-
-        # 背景から地面Yを推定してグローバル更新
         set_ground_y(detect_ground_y(self._img))
 
     def update(self, screen: pg.Surface):
@@ -184,20 +183,10 @@ class Background:
         screen.blit(self._img, (self._x1, 0))
         screen.blit(self._img, (self._x2, 0))
 
-    def set_speed(self, v: int) -> None:
-        self._speed = v
-
-    def get_speed(self) -> int:
-        return self._speed
-
-    def get_image(self) -> pg.Surface:
-        return self._img
-
 
 class Bird(pg.sprite.Sprite):
     """
     プレイヤー：左右移動＋ジャンプ＋二段ジャンプ
-    ※常に“地面に足がつく”＝接地時は ground_y に rect.bottom を合わせる
     """
     def __init__(self, num: int, xy: tuple[int, int]):
         super().__init__()
@@ -207,11 +196,10 @@ class Bird(pg.sprite.Sprite):
         self._imgs = {+1: img, -1: img0}
         self._dir = +1
 
-        # pygame互換（Group.draw用）
         self.image = self._imgs[self._dir]
         self.rect = self.image.get_rect()
 
-        # 物理
+        # 物理（ここは一切変更しない）
         self._vx = 0
         self._vy = 0.0
         self._speed = 8
@@ -238,26 +226,21 @@ class Bird(pg.sprite.Sprite):
             self._vx = +self._speed*0.5
             self._dir = +1
 
-        # 横移動
         self.rect.x += self._vx
         self.rect = clamp_in_screen(self.rect)
 
-        # 重力
         self._vy += self._gravity
         self.rect.y += int(self._vy)
 
-        # 接地（背景に合わせた地面Y）
         gy = get_ground_y()
         if self.rect.bottom >= gy:
             self.rect.bottom = gy
             self._vy = 0.0
             self._jump_count = 0
 
-        # 描画
         self.image = self._imgs[self._dir]
         screen.blit(self.image, self.rect)
 
-    # getters（必要なものだけ）
     def get_rect(self) -> pg.Rect:
         return self.rect
 
@@ -281,7 +264,6 @@ class Enemy(pg.sprite.Sprite):
     """
     def __init__(self, stage: int):
         super().__init__()
-        self._stage = stage
         self._speed = stage_params(stage)["enemy_speed"]
 
         w = random.randint(40, 70)
@@ -295,10 +277,7 @@ class Enemy(pg.sprite.Sprite):
 
     def update(self) -> None:
         self.rect.x -= self._speed
-
-        # ステージ切替で ground_y が変わっても地面に合わせ続ける
         self.rect.bottom = get_ground_y()
-
         if self.rect.right < 0:
             self.kill()
 
@@ -656,8 +635,77 @@ def main():
     }
     inv = Inventory(ITEM_DEFS)
 
-    tmr = 0
+    # ===== 他の人のアイテムGroupを受け取る場所 =====
+    # 統合するときは、次の1行を「相手が作った items（pg.sprite.Group）」に差し替えるだけでOK
+    items = pg.sprite.Group()
 
+    # ===== HP/Score/UI =====
+    hp = HP_MAX
+    score = 0
+    font = pg.font.Font(None, 36)
+    dmg_popup_tmr = 0
+    inv_tmr = 0
+
+    # ===== 右下UI（Attack/Status） =====
+    current_attack: str | None = None
+    current_status: str | None = None
+
+    font_ui = pg.font.Font(None, 26)
+    font_item = pg.font.Font(None, 22)
+
+    attack_box = pg.Rect(
+        WIDTH - (BOX_W * 2 + BOX_GAP) - BOX_MARGIN,
+        HEIGHT - BOX_H - BOX_MARGIN,
+        BOX_W, BOX_H
+    )
+    status_box = pg.Rect(
+        WIDTH - BOX_W - BOX_MARGIN,
+        HEIGHT - BOX_H - BOX_MARGIN,
+        BOX_W, BOX_H
+    )
+
+    def read_item_info(it) -> tuple[str | None, str | None]:
+        """
+        他人実装の属性名ズレを吸収して (kind, name) を返す
+        kind: "attack" or "status"
+        name: 表示名
+        """
+        kind = None
+        for k in ("kind", "type", "category"):
+            v = getattr(it, k, None)
+            if isinstance(v, str):
+                kind = v.lower()
+                break
+
+        name = None
+        for k in ("name", "item_name", "label"):
+            v = getattr(it, k, None)
+            if isinstance(v, str):
+                name = v
+                break
+
+        if kind in ("atk", "attack_item"):
+            kind = "attack"
+        if kind in ("sts", "status_item"):
+            kind = "status"
+
+        return kind, name
+
+    # ===== Score縁取り描画（追加）=====
+    def draw_text_outline(surf: pg.Surface, text: str, font_: pg.font.Font, pos: tuple[int, int],
+                          text_color: tuple[int, int, int], outline_color: tuple[int, int, int],
+                          outline_px: int = 2) -> None:
+        x, y = pos
+        outline = font_.render(text, True, outline_color)
+        for ox in range(-outline_px, outline_px + 1):
+            for oy in range(-outline_px, outline_px + 1):
+                if ox == 0 and oy == 0:
+                    continue
+                surf.blit(outline, (x + ox, y + oy))
+        body = font_.render(text, True, text_color)
+        surf.blit(body, (x, y))
+
+    tmr = 0
     while True:
         key_lst = pg.key.get_pressed()
 
@@ -683,11 +731,10 @@ def main():
             stage = 2
             params = stage_params(stage)
             bg = Background(params["bg_file"], params["bg_speed"])
-            # bird を新しい地面Yへ合わせる（めり込み/浮きを防ぐ）
             bird.get_rect().bottom = get_ground_y()
             apply_status_from_current(inv, bird)
 
-        # 敵生成：複数流入
+        # 敵生成：複数流入（変更なし）
         if tmr % params["spawn_interval"] == 0:
             spawn_enemy(enemies, stage)
             if random.random() < 0.30:
@@ -695,12 +742,12 @@ def main():
 
         maybe_spawn_item(tmr, stage, ITEM_DEFS, items)
 
-        # 描画
+        # ===== 描画（速度など変更なし）=====
         bg.update(screen)
-
         if DEBUG_DRAW_GROUND_LINE:
             pg.draw.line(screen, (0, 0, 0), (0, get_ground_y()), (WIDTH, get_ground_y()), 2)
 
+        # 更新
         bird.update(key_lst, screen)
         enemies.update()
         items.update()
@@ -725,11 +772,84 @@ def main():
             else:
                 apply_status_pickup(item_id, inv, bird)
         
+        items.update()  # ← 他の人のアイテム（右→左）は相手update内で動く想定
+
+        # ===== 敵ダメージ（HP-20）=====
+        if inv_tmr > 0:
+            inv_tmr -= 1
+
+        hit_list = pg.sprite.spritecollide(bird, enemies, False)
+        if hit_list and inv_tmr == 0:
+            hp = max(0, hp - DMG)
+
+            if hp <= 0:
+                return 0
+
+            for e in hit_list:
+                e.kill()
+
+            dmg_popup_tmr = POPUP_FRAMES
+            inv_tmr = INV_FRAMES
+
+        # ===== アイテム取得（触れたら取得→右下表示を置き換え）=====
+        got_items = pg.sprite.spritecollide(bird, items, True)  # True=拾ったら消える
+        for it in got_items:
+            kind, name = read_item_info(it)
+            if kind == "attack":
+                current_attack = name if name is not None else "Unknown"
+            elif kind == "status":
+                current_status = name if name is not None else "Unknown"
+
+        # 描画（スプライト）
+        items.draw(screen)
         enemies.draw(screen)
         items.draw(screen)
         beams.draw(screen)
         arrows.draw(screen)
         exps.draw(screen)
+
+        # ===== UI：HP（左下）=====
+        hp_pos = (20, HEIGHT - 50)
+        hp_text = font.render(f"HP:{hp}", True, (255, 255, 255))
+        screen.blit(hp_text, hp_pos)
+
+        # HPバー（残りHPを緑）
+        bar_x, bar_y = 20, HEIGHT - 25
+        bar_w, bar_h = 200, 14
+        pg.draw.rect(screen, (0, 0, 0), (bar_x - 2, bar_y - 2, bar_w + 4, bar_h + 4))
+        pg.draw.rect(screen, (255, 255, 255), (bar_x, bar_y, bar_w, bar_h))
+        hp_ratio = max(0, min(1, hp / HP_MAX))
+        pg.draw.rect(screen, (0, 200, 0), (bar_x, bar_y, int(bar_w * hp_ratio), bar_h))
+
+        # 「-20」赤表示（約2秒）
+        if dmg_popup_tmr > 0:
+            dmg_popup_tmr -= 1
+            dmg_text = font.render(f"-{DMG}", True, (255, 0, 0))
+            screen.blit(dmg_text, (hp_pos[0] + hp_text.get_width() + 10, hp_pos[1]))
+
+        # ===== UI：Score（右上：白縁＋中黒）=====
+        score_str = f"Score:{score}"
+        tmp = font.render(score_str, True, (0, 0, 0))  # 幅取得用
+        score_pos = (WIDTH - tmp.get_width() - 20, 20)
+        draw_text_outline(screen, score_str, font, score_pos, (0, 0, 0), (255, 255, 255), outline_px=2)
+
+        # ===== UI：右下 Attack / Status（黒塗り＋白枠）=====
+        pg.draw.rect(screen, (0, 0, 0), attack_box)
+        pg.draw.rect(screen, (255, 255, 255), attack_box, 2)
+        pg.draw.rect(screen, (0, 0, 0), status_box)
+        pg.draw.rect(screen, (255, 255, 255), status_box, 2)
+
+        atk_label = font_ui.render("Attack", True, (255, 255, 255))
+        sta_label = font_ui.render("Status", True, (255, 255, 255))
+        screen.blit(atk_label, (attack_box.x + 10, attack_box.y + 8))
+        screen.blit(sta_label, (status_box.x + 10, status_box.y + 8))
+
+        atk_name = current_attack if current_attack is not None else "-"
+        sta_name = current_status if current_status is not None else "-"
+        atk_text = font_item.render(atk_name, True, (255, 255, 255))
+        sta_text = font_item.render(sta_name, True, (255, 255, 255))
+        screen.blit(atk_text, (attack_box.x + 12, attack_box.y + 40))
+        screen.blit(sta_text, (status_box.x + 12, status_box.y + 40))
 
         pg.display.update()
         
